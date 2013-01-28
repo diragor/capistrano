@@ -7,6 +7,10 @@ _cset :expire_assets_after, (3600 * 24 * 7)
 
 _cset :normalize_asset_timestamps, false
 
+def shared_manifest_path
+  capture("ls #{shared_path.shellescape}/assets/manifest*").strip
+end
+
 before 'deploy:finalize_update',   'deploy:assets:symlink'
 after  'deploy:update_code',       'deploy:assets:precompile'
 before 'deploy:assets:precompile', 'deploy:assets:update_asset_mtimes'
@@ -45,8 +49,11 @@ namespace :deploy do
     task :precompile, :roles => assets_role, :except => { :no_release => true } do
       run <<-CMD.compact
         cd -- #{latest_release.shellescape} &&
-        #{rake} RAILS_ENV=#{rails_env.to_s.shellescape} #{asset_env} assets:precompile &&
-        cp -- #{shared_path.shellescape}/assets/manifest.yml #{current_release.shellescape}/assets_manifest.yml
+        #{rake} RAILS_ENV=#{rails_env.to_s.shellescape} #{asset_env} assets:precompile
+      CMD
+      manifest_file = File.basename(shared_manifest_path)
+      run <<-CMD.compact
+        cp -- #{shared_path.shellescape}/assets/#{manifest_file} #{current_release.shellescape}/assets_#{manifest_file}
       CMD
     end
 
@@ -55,12 +62,12 @@ namespace :deploy do
       This task runs before assets:precompile.
     DESC
     task :update_asset_mtimes, :roles => assets_role, :except => { :no_release => true } do
-      # Fetch assets/manifest.yml contents.
-      manifest_path = "#{shared_path}/assets/manifest.yml"
-      manifest_yml = capture("[ -e #{manifest_path.shellescape} ] && cat #{manifest_path.shellescape} || echo").strip
+      # Fetch assets/manifest contents.
+      manifest_path = shared_manifest_path
+      manifest_content = capture("[ -e #{manifest_path.shellescape} ] && cat #{manifest_path.shellescape} || echo").strip
 
-      if manifest_yml != ""
-        manifest = YAML.load(manifest_yml)
+      if manifest_content != ""
+        manifest = (File.extname(manifest_path) == '.yml') ? YAML.load(manifest_content) : JSON.parse(manifest_content)
         current_assets = manifest.to_a.flatten.map {|a| [a, "#{a}.gz"] }.flatten
         logger.info "Updating mtimes for ~#{current_assets.count} assets..."
         put current_assets.map{|a| "#{shared_path}/assets/#{a}" }.join("\n"), "#{deploy_to}/TOUCH_ASSETS"
@@ -95,26 +102,27 @@ namespace :deploy do
       an existing release.
     DESC
     task :clean_expired, :roles => assets_role, :except => { :no_release => true } do
-      # Fetch all assets_manifest.yml contents.
+      # Fetch all assets_manifest contents.
       manifests_output = capture <<-CMD.compact
-        for manifest in #{releases_path.shellescape}/*/assets_manifest.yml; do
+        for manifest in #{releases_path.shellescape}/*/assets_manifest*; do
           cat -- "$manifest" 2> /dev/null && printf ':::' || true;
         done
       CMD
       manifests = manifests_output.split(':::')
 
       if manifests.empty?
-        logger.info "No manifests in #{releases_path}/*/assets_manifest.yml"
+        logger.info "No manifests in #{releases_path}/*/assets_manifest*"
       else
-        logger.info "Fetched #{manifests.count} manifests from #{releases_path}/*/assets_manifest.yml"
+        logger.info "Fetched #{manifests.count} manifests from #{releases_path}/*/assets_manifest*"
         current_assets = Set.new
-        manifests.each do |yaml|
-          manifest = YAML.load(yaml)
+        manifests.each do |content|
+          manifest = (content.strip[0] == '{') ? JSON.parse(content) : YAML.load(content)
           current_assets += manifest.to_a.flatten.flat_map do |file|
             [file, "#{file}.gz"]
           end
         end
-        current_assets += %w(manifest.yml sources_manifest.yml)
+        current_manifest_file = File.basename(shared_manifest_path)
+        current_assets += [current_manifest_file, 'sources_manifest.yml']
 
         # Write the list of required assets to server.
         logger.info "Writing required assets to #{deploy_to}/REQUIRED_ASSETS..."
@@ -145,7 +153,8 @@ namespace :deploy do
       to shared/assets/manifest.yml, and finally recompiling or regenerating nondigest assets.
     DESC
     task :rollback, :roles => assets_role, :except => { :no_release => true } do
-      previous_manifest = "#{previous_release}/assets_manifest.yml"
+      #previous_manifest = "#{previous_release}/assets_manifest.yml"
+      previous_manifest = capture("ls #{previous_release.shellescape}/assets_manifest*").strip
       if capture("[ -e #{previous_manifest.shellescape} ] && echo true || echo false").strip != 'true'
         puts "#{previous_manifest} is missing! Cannot roll back assets. " <<
              "Please run deploy:assets:precompile to update your assets when the rollback is finished."
@@ -153,7 +162,8 @@ namespace :deploy do
       else
         run <<-CMD.compact
           cd -- #{previous_release.shellescape} &&
-          cp -f -- #{previous_manifest.shellescape} #{shared_path.shellescape}/assets/manifest.yml &&
+          rm -f #{shared_manifest_path} &&
+          cp -f -- #{previous_manifest.shellescape} #{shared_path.shellescape}/assets/#{File.basename(previous_manifest)[7..-1]} &&
           #{rake} RAILS_ENV=#{rails_env.to_s.shellescape} #{asset_env} assets:precompile:nondigest
         CMD
       end
